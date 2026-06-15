@@ -129,7 +129,6 @@ class AWSCostAnalyzer:
             Metrics=['UnblendedCost', 'UsageQuantity'],
             GroupBy=[
                 {'Type': 'DIMENSION', 'Key': 'SERVICE'},
-                {'Type': 'DIMENSION', 'Key': 'LINKED_ACCOUNT'},
                 {'Type': 'DIMENSION', 'Key': 'REGION'}
             ],
             Filter={
@@ -216,7 +215,6 @@ class AWSCostAnalyzer:
             Granularity='MONTHLY',
             Metrics=['UnblendedCost', 'UsageQuantity'],
             GroupBy=[
-                {'Type': 'DIMENSION', 'Key': 'USAGE_TYPE'},
                 {'Type': 'DIMENSION', 'Key': 'SERVICE'},
                 {'Type': 'DIMENSION', 'Key': 'REGION'}
             ]
