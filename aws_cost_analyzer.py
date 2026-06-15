@@ -2,7 +2,8 @@
 """
 AWS Cost Analysis & Optimization Report Generator
 ==================================================
-Multi-Region Support - Scans ALL AWS regions where resources exist
+Multi-Region Support - Scans ALL AWS regions one by one
+Skips empty regions, checks all resources properly
 Generates detailed Excel reports for:
 - Last 6 months cost breakdown by resource (all regions)
 - Idle resource identification & recommendations (per region)
@@ -20,8 +21,6 @@ from dateutil.relativedelta import relativedelta
 import json
 import os
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import threading
 
 # ============================================================
 # CONFIGURATION
@@ -120,6 +119,8 @@ class AWSCostAnalyzer:
         start_date = end_date - relativedelta(months=months_back)
         start_date = start_date.replace(day=1)
         
+        # AWS Cost Explorer only allows max 2 GroupBy dimensions
+        # First call: GroupBy SERVICE + LINKED_ACCOUNT
         response = self.ce_client.get_cost_and_usage(
             TimePeriod={
                 'Start': start_date.strftime('%Y-%m-%d'),
@@ -129,7 +130,7 @@ class AWSCostAnalyzer:
             Metrics=['UnblendedCost', 'UsageQuantity'],
             GroupBy=[
                 {'Type': 'DIMENSION', 'Key': 'SERVICE'},
-                {'Type': 'DIMENSION', 'Key': 'REGION'}
+                {'Type': 'DIMENSION', 'Key': 'LINKED_ACCOUNT'}
             ],
             Filter={
                 'Not': {
@@ -147,7 +148,6 @@ class AWSCostAnalyzer:
             for group in result.get('Groups', []):
                 service = group['Keys'][0]
                 account = group['Keys'][1]
-                region = group['Keys'][2]
                 usd_cost = float(group['Metrics']['UnblendedCost']['Amount'])
                 usage_qty = float(group['Metrics']['UsageQuantity']['Amount'])
                 
@@ -155,12 +155,70 @@ class AWSCostAnalyzer:
                     'Month': month,
                     'Service': service,
                     'Account_ID': account,
-                    'Region': region,
+                    'Region': 'Global',  # Placeholder - will be updated with second call
                     'Cost_USD': round(usd_cost, 4),
                     'Cost_INR': self.convert_to_inr(usd_cost),
                     'Usage_Quantity': round(usage_qty, 4),
                     'Currency': 'INR'
                 })
+        
+        # Second call: GroupBy SERVICE + REGION to get region breakdown
+        try:
+            response_region = self.ce_client.get_cost_and_usage(
+                TimePeriod={
+                    'Start': start_date.strftime('%Y-%m-%d'),
+                    'End': end_date.strftime('%Y-%m-%d')
+                },
+                Granularity='MONTHLY',
+                Metrics=['UnblendedCost'],
+                GroupBy=[
+                    {'Type': 'DIMENSION', 'Key': 'SERVICE'},
+                    {'Type': 'DIMENSION', 'Key': 'REGION'}
+                ],
+                Filter={
+                    'Not': {
+                        'Dimensions': {
+                            'Key': 'RECORD_TYPE',
+                            'Values': ['Credit', 'Refund', 'UpfrontReservationFee']
+                        }
+                    }
+                }
+            )
+            
+            region_costs = []
+            for result in response_region.get('ResultsByTime', []):
+                month = result['TimePeriod']['Start']
+                for group in result.get('Groups', []):
+                    service = group['Keys'][0]
+                    region = group['Keys'][1]
+                    usd_cost = float(group['Metrics']['UnblendedCost']['Amount'])
+                    
+                    region_costs.append({
+                        'Month': month,
+                        'Service': service,
+                        'Region': region,
+                        'Cost_USD': round(usd_cost, 4),
+                        'Cost_INR': self.convert_to_inr(usd_cost)
+                    })
+            
+            # Merge region data with main costs
+            region_df = pd.DataFrame(region_costs)
+            if not region_df.empty:
+                # Create a mapping of month+service to region costs
+                region_pivot = region_df.groupby(['Month', 'Service', 'Region'])['Cost_INR'].sum().reset_index()
+                
+                # For each cost entry, find matching region data
+                for i, row in enumerate(costs_data):
+                    matching = region_pivot[
+                        (region_pivot['Month'] == row['Month']) & 
+                        (region_pivot['Service'] == row['Service'])
+                    ]
+                    if not matching.empty:
+                        # Get the region with highest cost for this service
+                        top_region = matching.loc[matching['Cost_INR'].idxmax(), 'Region']
+                        costs_data[i]['Region'] = top_region
+        except Exception as e:
+            print(f"   ⚠️  Could not get region breakdown: {e}")
         
         return pd.DataFrame(costs_data)
     
@@ -170,6 +228,7 @@ class AWSCostAnalyzer:
         start_date = today.replace(day=1)
         end_date = today + timedelta(days=1)
         
+        # First call: GroupBy SERVICE + REGION (max 2 dimensions)
         response = self.ce_client.get_cost_and_usage(
             TimePeriod={
                 'Start': start_date.strftime('%Y-%m-%d'),
@@ -207,6 +266,7 @@ class AWSCostAnalyzer:
         start_date = end_date - relativedelta(months=months_back)
         start_date = start_date.replace(day=1)
         
+        # Max 2 GroupBy dimensions: USAGE_TYPE + SERVICE
         response = self.ce_client.get_cost_and_usage(
             TimePeriod={
                 'Start': start_date.strftime('%Y-%m-%d'),
@@ -215,8 +275,8 @@ class AWSCostAnalyzer:
             Granularity='MONTHLY',
             Metrics=['UnblendedCost', 'UsageQuantity'],
             GroupBy=[
-                {'Type': 'DIMENSION', 'Key': 'SERVICE'},
-                {'Type': 'DIMENSION', 'Key': 'REGION'}
+                {'Type': 'DIMENSION', 'Key': 'USAGE_TYPE'},
+                {'Type': 'DIMENSION', 'Key': 'SERVICE'}
             ]
         )
         
@@ -226,7 +286,6 @@ class AWSCostAnalyzer:
             for group in result.get('Groups', []):
                 usage_type = group['Keys'][0]
                 service = group['Keys'][1]
-                region = group['Keys'][2]
                 usd_cost = float(group['Metrics']['UnblendedCost']['Amount'])
                 usage_qty = float(group['Metrics']['UsageQuantity']['Amount'])
                 
@@ -234,7 +293,7 @@ class AWSCostAnalyzer:
                     'Month': month,
                     'Usage_Type': usage_type,
                     'Service': service,
-                    'Region': region,
+                    'Region': 'Global',
                     'Cost_USD': round(usd_cost, 4),
                     'Cost_INR': self.convert_to_inr(usd_cost),
                     'Usage_Quantity': round(usage_qty, 4)
@@ -243,10 +302,54 @@ class AWSCostAnalyzer:
         return pd.DataFrame(usage_data)
     
     # ============================================================
-    # MULTI-REGION IDLE RESOURCE DETECTION
+    # REGION-BY-REGION IDLE RESOURCE DETECTION
     # ============================================================
     
-    def _scan_region_ec2(self, region):
+    def check_region_has_resources(self, region):
+        """Quick check if region has any resources we care about"""
+        try:
+            ec2 = self._get_regional_client('ec2', region)
+            
+            # Check for running EC2 instances
+            instances = ec2.describe_instances(MaxResults=5)
+            for reservation in instances.get('Reservations', []):
+                if reservation.get('Instances'):
+                    return True
+            
+            # Check for volumes
+            volumes = ec2.describe_volumes(MaxResults=5)
+            if volumes.get('Volumes'):
+                return True
+            
+            # Check for addresses (EIPs)
+            addresses = ec2.describe_addresses()
+            if addresses.get('Addresses'):
+                return True
+            
+            # Check RDS
+            try:
+                rds = self._get_regional_client('rds', region)
+                dbs = rds.describe_db_instances(MaxRecords=5)
+                if dbs.get('DBInstances'):
+                    return True
+            except:
+                pass
+            
+            # Check ELB
+            try:
+                elb = self._get_regional_client('elbv2', region)
+                lbs = elb.describe_load_balancers(PageSize=5)
+                if lbs.get('LoadBalancers'):
+                    return True
+            except:
+                pass
+            
+            return False
+        except Exception as e:
+            print(f"   ⚠️  {region}: Error checking resources - {str(e)[:60]}")
+            return False
+    
+    def scan_region_ec2(self, region):
         """Scan a single region for idle EC2 instances"""
         idle_instances = []
         try:
@@ -311,7 +414,7 @@ class AWSCostAnalyzer:
         
         return idle_instances
     
-    def _scan_region_rds(self, region):
+    def scan_region_rds(self, region):
         """Scan a single region for idle RDS instances"""
         idle_rds = []
         try:
@@ -385,7 +488,7 @@ class AWSCostAnalyzer:
         
         return idle_rds
     
-    def _scan_region_ebs(self, region):
+    def scan_region_ebs(self, region):
         """Scan a single region for unattached EBS volumes"""
         unattached = []
         try:
@@ -428,7 +531,7 @@ class AWSCostAnalyzer:
         
         return unattached
     
-    def _scan_region_elb(self, region):
+    def scan_region_elb(self, region):
         """Scan a single region for idle load balancers"""
         idle_lbs = []
         try:
@@ -486,7 +589,7 @@ class AWSCostAnalyzer:
         
         return idle_lbs
     
-    def _scan_region_eip(self, region):
+    def scan_region_eip(self, region):
         """Scan a single region for unattached Elastic IPs"""
         unattached = []
         try:
@@ -517,57 +620,49 @@ class AWSCostAnalyzer:
         
         return unattached
     
-    def scan_all_regions_idle_resources(self, max_workers=5):
-        """Scan all regions for idle resources using thread pool"""
-        print(f"\n🌐 Scanning {len(self.all_regions)} regions for idle resources...")
-        print(f"   Using {max_workers} parallel workers\n")
+    def scan_all_regions_idle_resources(self):
+        """Scan all regions one by one for idle resources"""
+        print(f"\n🌐 Scanning {len(self.all_regions)} regions one by one for idle resources...")
         
         all_idle = {
             'EC2': [], 'RDS': [], 'EBS': [], 'ELB': [], 'EIP': []
         }
         
-        def scan_region(region):
-            """Scan a single region for all resource types"""
-            region_results = {
-                'EC2': [], 'RDS': [], 'EBS': [], 'ELB': [], 'EIP': [],
-                'region': region
-            }
+        active_regions = []
+        empty_regions = []
+        
+        for region in self.all_regions:
+            print(f"\n   🔎 Checking {region}...")
             
-            # Check if region is accessible
-            try:
-                ec2 = self._get_regional_client('ec2', region)
-                ec2.describe_regions(RegionNames=[region])
-            except Exception:
-                print(f"   ❌ {region}: Region not accessible, skipping...")
-                return region_results
+            # Check if region has any resources
+            has_resources = self.check_region_has_resources(region)
             
-            print(f"   🔎 Scanning {region}...")
+            if not has_resources:
+                print(f"   ⏭️  {region}: No resources found, skipping...")
+                empty_regions.append(region)
+                continue
             
-            region_results['EC2'] = self._scan_region_ec2(region)
-            region_results['RDS'] = self._scan_region_rds(region)
-            region_results['EBS'] = self._scan_region_ebs(region)
-            region_results['ELB'] = self._scan_region_elb(region)
-            region_results['EIP'] = self._scan_region_eip(region)
+            active_regions.append(region)
+            print(f"   ✅ {region}: Resources found, scanning for idle resources...")
             
-            total_found = sum(len(v) for k, v in region_results.items() if k != 'region')
-            if total_found > 0:
-                print(f"   ✅ {region}: Found {total_found} idle resources")
+            # Scan all resource types
+            ec2_idle = self.scan_region_ec2(region)
+            rds_idle = self.scan_region_rds(region)
+            ebs_idle = self.scan_region_ebs(region)
+            elb_idle = self.scan_region_elb(region)
+            eip_idle = self.scan_region_eip(region)
+            
+            all_idle['EC2'].extend(ec2_idle)
+            all_idle['RDS'].extend(rds_idle)
+            all_idle['EBS'].extend(ebs_idle)
+            all_idle['ELB'].extend(elb_idle)
+            all_idle['EIP'].extend(eip_idle)
+            
+            region_total = len(ec2_idle) + len(rds_idle) + len(ebs_idle) + len(elb_idle) + len(eip_idle)
+            if region_total > 0:
+                print(f"   🎯 {region}: Found {region_total} idle resources")
             else:
                 print(f"   ✓ {region}: No idle resources found")
-            
-            return region_results
-        
-        # Use ThreadPoolExecutor for parallel scanning
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            future_to_region = {
-                executor.submit(scan_region, region): region 
-                for region in self.all_regions
-            }
-            
-            for future in as_completed(future_to_region):
-                result = future.result()
-                for resource_type in ['EC2', 'RDS', 'EBS', 'ELB', 'EIP']:
-                    all_idle[resource_type].extend(result[resource_type])
         
         # Combine all into DataFrames
         idle_ec2 = pd.DataFrame(all_idle['EC2'])
@@ -579,7 +674,16 @@ class AWSCostAnalyzer:
         all_idle_df = pd.concat([idle_ec2, idle_rds, idle_ebs, idle_elb, idle_eip], ignore_index=True)
         
         total_count = len(all_idle_df)
-        print(f"\n📊 Total idle resources found across all regions: {total_count}")
+        print(f"\n" + "=" * 60)
+        print(f"📊 SCAN SUMMARY")
+        print(f"=" * 60)
+        print(f"   Total regions checked: {len(self.all_regions)}")
+        print(f"   Active regions (with resources): {len(active_regions)}")
+        print(f"   Empty regions (skipped): {len(empty_regions)}")
+        if empty_regions:
+            print(f"   Empty regions: {', '.join(empty_regions)}")
+        print(f"   Total idle resources found: {total_count}")
+        print(f"=" * 60)
         
         return idle_ec2, idle_rds, idle_ebs, idle_elb, idle_eip, all_idle_df
     
