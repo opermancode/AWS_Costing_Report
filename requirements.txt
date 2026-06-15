@@ -1,0 +1,18 @@
+# AWS Cost Analysis & Optimization Tool
+# Requirements File
+# Install with: pip install -r requirements.txt
+
+# AWS SDK for Python - Core dependency for all AWS API calls
+boto3>=1.28.0
+
+# Data manipulation and analysis library
+pandas>=2.0.0
+
+# Excel file reading/writing engine (required by pandas for .xlsx files)
+openpyxl>=3.1.0
+
+# Advanced Excel formatting engine for pandas ExcelWriter
+xlsxwriter>=3.1.0
+
+# Date/time utilities for month calculations
+python-dateutil>=2.8.0
