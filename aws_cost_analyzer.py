@@ -64,9 +64,20 @@ IDLE_THRESHOLDS = {
 # ============================================================
 
 class AWSCostAnalyzer:
-    def __init__(self, profile_name=None, region='us-east-1'):
+    def __init__(self, profile_name=None, access_key=None, secret_key=None, session_token=None, region='us-east-1'):
         """Initialize AWS clients and discover all regions"""
-        self.session = boto3.Session(profile_name=profile_name) if profile_name else boto3.Session()
+        
+        # Create session with credentials if provided
+        if access_key and secret_key:
+            self.session = boto3.Session(
+                aws_access_key_id=access_key,
+                aws_secret_access_key=secret_key,
+                aws_session_token=session_token
+            )
+        elif profile_name:
+            self.session = boto3.Session(profile_name=profile_name)
+        else:
+            self.session = boto3.Session()
         
         # Cost Explorer is global - single client
         self.ce_client = self.session.client('ce', region_name='us-east-1')
@@ -1170,6 +1181,9 @@ def main():
     
     parser = argparse.ArgumentParser(description='AWS Multi-Region Cost Analysis & Optimization Report')
     parser.add_argument('--profile', type=str, help='AWS profile name (from ~/.aws/credentials)')
+    parser.add_argument('--access-key', type=str, help='AWS Access Key ID')
+    parser.add_argument('--secret-key', type=str, help='AWS Secret Access Key')
+    parser.add_argument('--session-token', type=str, help='AWS Session Token (for temporary credentials)')
     parser.add_argument('--output', type=str, default='aws_cost_report.xlsx', help='Output Excel file name')
     parser.add_argument('--exchange-rate', type=float, default=83.5, help='USD to INR exchange rate')
     parser.add_argument('--months', type=int, default=6, help='Number of months to analyze')
@@ -1185,12 +1199,17 @@ def main():
     print("=" * 70)
     
     try:
-        analyzer = AWSCostAnalyzer(profile_name=args.profile)
+        analyzer = AWSCostAnalyzer(
+            profile_name=args.profile,
+            access_key=args.access_key,
+            secret_key=args.secret_key,
+            session_token=args.session_token
+        )
         analyzer.generate_excel_report(output_file=args.output)
     except Exception as e:
         print(f"\n❌ Error: {e}")
         print("\nTroubleshooting:")
-        print("1. Ensure AWS credentials are configured (aws configure)")
+        print("1. Ensure AWS credentials are valid")
         print("2. Ensure Cost Explorer is enabled in AWS Console")
         print("3. Check IAM permissions for all services in all regions")
         print("4. Install required packages: pip install -r requirements.txt")
